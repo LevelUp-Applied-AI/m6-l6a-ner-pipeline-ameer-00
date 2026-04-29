@@ -7,6 +7,7 @@ and Hugging Face on climate-related text data.
 Run: python ner_pipeline.py
 """
 
+import unicodedata
 import pandas as pd
 import numpy as np
 import spacy
@@ -22,8 +23,8 @@ def load_data(filepath="data/climate_articles.csv"):
     Returns:
         DataFrame with columns: id, text, source, language, category.
     """
-    # TODO: Load the CSV and return the DataFrame
-    pass
+    df = pd.read_csv(filepath)
+    return df
 
 
 def explore_data(df):
@@ -39,9 +40,17 @@ def explore_data(df):
           'category_counts': dict mapping category -> row count
           'text_length_stats': dict with 'mean', 'min', 'max' word counts
     """
-    # TODO: Compute shape, language/category value_counts, and word-count
-    #       statistics on df['text']
-    pass
+    word_counts = df["text"].str.split().str.len()
+    return {
+        "shape": tuple(df.shape),
+        "lang_counts": df["language"].value_counts().to_dict(),
+        "category_counts": df["category"].value_counts().to_dict(),
+        "text_length_stats": {
+            "mean": float(word_counts.mean()),
+            "min": int(word_counts.min()),
+            "max": int(word_counts.max()),
+        },
+    }
 
 
 def preprocess_text(text, nlp):
@@ -57,9 +66,14 @@ def preprocess_text(text, nlp):
     Returns:
         List of cleaned, lemmatized token strings.
     """
-    # TODO: NFC-normalize the text, run it through nlp(), drop
-    #       punctuation/whitespace tokens, return lowercased lemmas
-    pass
+    normalized = unicodedata.normalize("NFC", text)
+    doc = nlp(normalized)
+    tokens = [
+        token.lemma_.lower()
+        for token in doc
+        if not token.is_punct and not token.is_space
+    ]
+    return tokens
 
 
 def extract_spacy_entities(df, nlp):
@@ -73,9 +87,23 @@ def extract_spacy_entities(df, nlp):
         DataFrame with columns: text_id, entity_text, entity_label,
         start_char, end_char.
     """
-    # TODO: Filter df to English rows, process each text with nlp,
-    #       collect entities into rows, return as a DataFrame
-    pass
+    rows = []
+    english_df = df[df["language"] == "en"]
+
+    for _, row in english_df.iterrows():
+        doc = nlp(row["text"])
+        for ent in doc.ents:
+            rows.append({
+                "text_id":      row["id"],
+                "entity_text":  ent.text,
+                "entity_label": ent.label_,
+                "start_char":   ent.start_char,
+                "end_char":     ent.end_char,
+            })
+
+    return pd.DataFrame(rows, columns=[
+        "text_id", "entity_text", "entity_label", "start_char", "end_char"
+    ])
 
 
 def extract_hf_entities(df, ner_pipeline):
@@ -91,10 +119,44 @@ def extract_hf_entities(df, ner_pipeline):
         DataFrame with columns: text_id, entity_text, entity_label,
         start_char, end_char.
     """
-    # TODO: Filter df to English rows, run each text through
-    #       ner_pipeline, merge ## subword tokens, strip B-/I- prefix
-    #       from labels (IOB format), return as a DataFrame
-    pass
+    rows = []
+    english_df = df[df["language"] == "en"]
+
+    for _, row in english_df.iterrows():
+        raw_entities = ner_pipeline(row["text"])
+
+        # Merge subword tokens (## tokens produced by BERT WordPiece)
+        merged = []
+        for token in raw_entities:
+            word = token["word"]
+            if word.startswith("##") and merged:
+                merged[-1]["word"] += word[2:]
+                merged[-1]["end"]   = token["end"]
+            else:
+                merged.append({
+                    "word":   word,
+                    "entity": token["entity"],
+                    "start":  token["start"],
+                    "end":    token["end"],
+                })
+
+        for ent in merged:
+            # Strip IOB prefix (B- / I-)
+            label = ent["entity"]
+            if label.startswith("B-") or label.startswith("I-"):
+                label = label[2:]
+
+            rows.append({
+                "text_id":      row["id"],
+                "entity_text":  ent["word"],
+                "entity_label": label,
+                "start_char":   ent["start"],
+                "end_char":     ent["end"],
+            })
+
+    return pd.DataFrame(rows, columns=[
+        "text_id", "entity_text", "entity_label", "start_char", "end_char"
+    ])
 
 
 def compare_ner_outputs(spacy_df, hf_df):
@@ -114,10 +176,18 @@ def compare_ner_outputs(spacy_df, hf_df):
           'spacy_only': set of (text_id, entity_text) tuples found only by spaCy
           'hf_only': set of (text_id, entity_text) tuples found only by HF
     """
-    # TODO: Count entities per label for each system, compute totals,
-    #       and derive the three overlap sets by matching on
-    #       (text_id, entity_text)
-    pass
+    spacy_pairs = set(zip(spacy_df["text_id"], spacy_df["entity_text"]))
+    hf_pairs    = set(zip(hf_df["text_id"],    hf_df["entity_text"]))
+
+    return {
+        "spacy_counts": spacy_df["entity_label"].value_counts().to_dict(),
+        "hf_counts":    hf_df["entity_label"].value_counts().to_dict(),
+        "total_spacy":  len(spacy_df),
+        "total_hf":     len(hf_df),
+        "both":         spacy_pairs & hf_pairs,
+        "spacy_only":   spacy_pairs - hf_pairs,
+        "hf_only":      hf_pairs - spacy_pairs,
+    }
 
 
 def evaluate_ner(predicted_df, gold_df):
@@ -136,9 +206,30 @@ def evaluate_ner(predicted_df, gold_df):
     Returns:
         Dictionary with keys: 'precision', 'recall', 'f1' (floats 0-1).
     """
-    # TODO: Match predicted entities to gold entities by text_id +
-    #       entity_text + entity_label, compute precision/recall/F1
-    pass
+    pred_set = set(zip(
+        predicted_df["text_id"],
+        predicted_df["entity_text"],
+        predicted_df["entity_label"],
+    ))
+    gold_set = set(zip(
+        gold_df["text_id"],
+        gold_df["entity_text"],
+        gold_df["entity_label"],
+    ))
+
+    tp = len(pred_set & gold_set)
+    fp = len(pred_set - gold_set)
+    fn = len(gold_set - pred_set)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
+
+    return {"precision": precision, "recall": recall, "f1": f1}
 
 
 if __name__ == "__main__":
@@ -186,3 +277,9 @@ if __name__ == "__main__":
             metrics = evaluate_ner(spacy_entities, gold)
             if metrics is not None:
                 print(f"\nspaCy evaluation: {metrics}")
+
+        # Evaluate HF against gold standard
+        if hf_entities is not None:
+            hf_metrics = evaluate_ner(hf_entities, gold)
+            if hf_metrics is not None:
+                print(f"HF evaluation: {hf_metrics}")
